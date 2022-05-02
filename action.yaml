@@ -1,0 +1,160 @@
+name: 'DWH microservices composite'
+description: 'DWH Microservices shared'
+inputs:
+  slack_channel:
+    required: true
+    default: "baran"
+  slack_username:
+    required: false
+    default: "github-actions"
+  slack_icon:
+    required: false
+    default: "https://i.postimg.cc/RVG6bWcm/github-actions-pxfd.png"
+  tf_apps_repository:
+    required: true
+  tf_apps_branch:
+    required: true
+    default: "master"
+  tf_apps_folder:
+    required: true
+    default: "tf-apps"
+  app_value_file:
+    required: true
+  vault_role:
+    required: true
+    default: "action-github-runner"
+  vault_url:
+    required: true
+  helmfile_version:
+    required: false
+    default: "v0.143.0"
+  kube_cluster:
+    required: true
+  ecr_username:
+    required: true
+    default: "AWS"
+  app_version:
+    required: true
+  kaniko_registry:
+    required: true
+    default: "266775278674.dkr.ecr.eu-west-1.amazonaws.com"
+  kaniko_image_name:
+    required: true
+  dockerfile:
+    required: true
+    default: "build/Dockerfile"
+  secrets:
+    required: false
+  helmfile_action:
+    required: true
+    default: "diff"
+  docker_build:
+    required: true
+    default: "no"
+
+runs:
+  using: "composite"
+  steps:
+    # Import Secrets
+    - id: secrets
+      uses: hashicorp/vault-action@v2.4.0
+      with:
+        url: ${{ inputs.vault_url }}
+        method: kubernetes
+        role:  ${{ inputs.vault_role }}
+        secrets: ${{ inputs.secrets }}
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1.6.1
+      with:
+        aws-access-key-id: ${{ steps.secrets.outputs.aws_key }}
+        aws-secret-access-key: ${{ steps.secrets.outputs.aws_secret }}
+        aws-region: eu-west-1
+
+    - name: Get ECR login
+      shell: bash
+      id: ecr
+      run: |
+        #!/usr/bin/env bash
+        set -e
+        PASSWORD=$(aws ecr get-login-password)
+        echo "::add-mask::${PASSWORD}"
+        echo "::set-output name=password::${PASSWORD}"
+
+    # Build docker image
+    - uses: aevea/action-kaniko@v0.8.0
+      if: ${{ inputs.docker_build }} == "yes"
+      with:
+        image: ${{ inputs.kaniko_image_name }}
+        registry: ${{ inputs.kaniko_registry }}
+        tag: ${{ inputs.app_version }}
+        build_file: ${{ inputs.dockerfile }}
+        username:  ${{ inputs.ecr_username }} # required
+        password: ${{ steps.ecr.outputs.password }} # required
+        extra_args: "--snapshotMode redo --cleanup --verbosity info --push-retry 2"
+
+    # Download tf-apps repo
+    - name: Checkout Server
+      uses: actions/checkout@v2
+      with:
+        repository: ${{ inputs.tf_apps_repository }}
+        ref: ${{ inputs.tf_apps_branch }}
+        token: ${{ steps.secrets.outputs.jenkins02_github_token }}
+        path: ${{ inputs.tf_apps_folder }}
+
+    # Helmfile config, without double action call, plugins doesnt work
+    - name: Setup helmfile
+      uses: mamezou-tech/setup-helmfile@v0.9.0
+      with:
+        helmfile-version: ${{ inputs.helmfile_version }}
+    - name: Setup helmfile
+      uses: mamezou-tech/setup-helmfile@v0.9.0
+      with:
+        helmfile-version: ${{ inputs.helmfile_version }}
+
+    # Kubernetes config
+    - name: Create kubernetes config
+      shell: bash
+      run: |
+        mkdir /home/runner/.kube
+        if [[ ${{ inputs.kube_cluster }} == workload-prod ]]
+        then
+          echo "${{ steps.secrets.outputs.PROD_KUBECONFIG_ENCODED }}" | base64 -d > /home/runner/.kube/config
+        elif [[ ${{ inputs.kube_cluster }} == workload-dev ]]
+        then
+          echo "${{ steps.secrets.outputs.DEV_KUBECONFIG_ENCODED }}" | base64 -d > /home/runner/.kube/config
+        else
+          echo "Unknown environment"
+        fi
+
+    # Helmfile install plugins, execute
+    - name: Helmfile
+      shell: bash
+      run: |
+        helmfile -f ${{ inputs.tf_apps_folder }}/${{ inputs.app_value_file }} --state-values-set appVersion=${{ inputs.app_version }} ${{ inputs.helmfile_action }}
+
+    # Get build status
+    - name: Get build status
+      shell: bash
+      id: build_status
+      run: |
+        if [[ ${{ job.status }} == success ]]
+        then
+          echo "::set-output name=slack_title::build successful"
+          echo "::set-output name=slack_msg::successfully built."
+        else
+          echo "::set-output name=slack_title::build failed"
+          echo "::set-output name=slack_msg::failed"
+        fi
+
+    # Send slack notification
+    - name: Slack Notification
+      uses: rtCamp/action-slack-notify@v2.2.0
+      env:
+        SLACK_WEBHOOK: ${{ steps.secrets.outputs.slack_info_webhook }}
+        SLACK_CHANNEL: ${{  inputs.slack_channel  }}
+        SLACK_USERNAME: ${{  inputs.slack_username  }}
+        SLACK_COLOR: ${{ job.status }}
+        SLACK_TITLE: DWH microservices - ${{ inputs.kaniko_image_name }}
+        SLACK_MESSAGE: "DWH microservice - ${{ inputs.kaniko_image_name }} deployed to ${{ inputs.kube_cluster }} with tag: ${{ inputs.app_version }} "
+        SLACK_ICON: ${{  inputs.slack_icon  }}
